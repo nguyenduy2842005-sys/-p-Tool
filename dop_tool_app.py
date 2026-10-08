@@ -1,290 +1,209 @@
 
 from __future__ import annotations
-
+import io, json, math
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
+import plotly.graph_objects as go
 
-from optimization_core import (
-    OptimizationSettings,
-    optimize_single_member,
-    variational_axial_solution,
+import beam_analysis_ui as ui
+from dop_optimizer import (
+    OptimizationSettings, analyze, force_envelopes, max_displacement,
+    variational_frame_candidate, finite_design_optimize, kkt_verify_design
 )
+from dop_report import build_report
 
+st.set_page_config(page_title="Đớp Tool — Structural Optimization", page_icon="🏗️", layout="wide")
 
-st.set_page_config(
-    page_title="Đớp Tool — Structural Optimization",
-    page_icon="🧠",
-    layout="wide",
-)
+def _state_df(key, columns):
+    df = st.session_state.get(key)
+    if df is None:
+        return pd.DataFrame(columns=columns)
+    return df.copy().reset_index(drop=True)
 
+def _model_from_state():
+    nd = _state_df("pf_nd_ed__data", ["x (m)", "y (m)"])
+    el = _state_df("pf_el_ed__data", ["i","j","E","A","I","udl_local"])
+    sp = _state_df("pf_sup_ed__data", ["node","Loại gối"])
+    nl = _state_df("pf_nl_ed__data", ["node","Fx (kN)","Fy (kN)","Mz (kNm)"])
 
-st.markdown("""
-<style>
-.block-container {max-width: 1500px; padding-top: 1.2rem;}
-.hero {
-    padding: 18px 22px;
-    border: 1px solid rgba(128,128,128,.25);
-    border-radius: 14px;
-    background: linear-gradient(135deg, rgba(30,80,150,.14), rgba(120,40,140,.08));
-}
-.hero h1 {margin:0; font-size: 2.25rem;}
-.hero p {margin:.35rem 0 0; opacity:.78;}
-.kpi {
-    border:1px solid rgba(128,128,128,.25);
-    border-radius:10px; padding:12px;
-}
-.small {font-size:.85rem; opacity:.72;}
-</style>
-""", unsafe_allow_html=True)
+    nodes = [{"x":float(r["x (m)"]), "y":float(r["y (m)"])}
+             for _,r in nd.iterrows() if pd.notna(r.get("x (m)")) and pd.notna(r.get("y (m)"))]
+    elements = []
+    for _,r in el.iterrows():
+        if pd.isna(r.get("i")) or pd.isna(r.get("j")): continue
+        elements.append({"i":int(r["i"]), "j":int(r["j"]),
+                         "E":float(r.get("E",210e6)), "A":float(r.get("A",0.01)),
+                         "I":float(r.get("I",1e-4)), "udl_local":float(r.get("udl_local",0) or 0)})
+    supports = []
+    for _,r in sp.iterrows():
+        if pd.isna(r.get("node")): continue
+        ux,uy,rz = ui._pf_label_to_bool(r.get("Loại gối","Ngàm"))
+        supports.append({"node":int(r["node"]), "ux":ux, "uy":uy, "rz":rz})
+    loads=[]
+    for _,r in nl.iterrows():
+        if pd.isna(r.get("node")): continue
+        loads.append({"node":int(r["node"]), "Fx":float(r.get("Fx (kN)",0) or 0),
+                       "Fy":float(r.get("Fy (kN)",0) or 0),
+                       "Mz":float(r.get("Mz (kNm)",0) or 0)})
+    return nodes,elements,supports,loads
 
+def show_model_summary():
+    nodes,elements,supports,loads = _model_from_state()
+    r = st.session_state.get("pf_result")
+    cols = st.columns(5)
+    vals=[("Nút",len(nodes)),("Thanh",len(elements)),("Gối",len(supports)),
+          ("Tải nút",len(loads)),("FEM","Đã chạy" if r is not None else "Chưa chạy")]
+    for c,(a,b) in zip(cols,vals):
+        c.metric(a,b)
 
-def plot_distribution(x, y, title, ytitle):
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=x, y=y, mode="lines+markers"))
-    fig.update_layout(
-        title=title,
-        xaxis_title="x (m)",
-        yaxis_title=ytitle,
-        height=360,
-        margin=dict(l=45, r=20, t=55, b=45),
-        template="plotly_white",
+def render_optimizer():
+    st.subheader("🧮 Tối ưu tiết diện bằng biến phân + FEM")
+    nodes,elements,supports,loads = _model_from_state()
+    if not elements:
+        st.warning("Hãy sang tab **Mô hình FEM** để vẽ thanh, gán gối/tải và bấm Solve trước.")
+        return
+
+    r = st.session_state.get("pf_result")
+    if r is None:
+        st.info("Mô hình đã có nhưng chưa có kết quả FEM. Quay lại tab Mô hình FEM và bấm ▶ Solve.")
+        return
+
+    c1,c2,c3,c4 = st.columns(4)
+    with c1: sigma = st.number_input("σ cho phép (MPa)", 1.0, 1000.0, 235.0, 1.0)
+    with c2: dlim = st.number_input("Chuyển vị cho phép (mm)", 0.1, 500.0, 20.0, 0.5)
+    with c3: Amin = st.number_input("Amin (mm²)", 1.0, 1e6, 100.0, 10.0)
+    with c4: Amax = st.number_input("Amax (mm²)", 100.0, 1e7, 200000.0, 100.0)
+
+    settings=OptimizationSettings(
+        sigma_allow=sigma*1000, disp_allow=dlim/1000,
+        A_min=Amin/1e6, A_max=Amax/1e6,
+        I_min=1e-8, I_max=5e-2
     )
-    return fig
+    st.session_state["dop_settings"] = settings
+    st.session_state["dop_disp_allow"] = settings.disp_allow
 
+    st.markdown("### 1. Kết quả FEM đầu vào")
+    show_model_summary()
+    st.write(f"**Chuyển vị lớn nhất hiện tại:** {max_displacement(r)*1000:.4f} mm")
+
+    env=force_envelopes(r)
+    df=pd.DataFrame({
+        "Thanh":[q["elem_idx"] for q in env],
+        "Nmax (kN)":[q["Nmax"] for q in env],
+        "Mmax (kNm)":[q["Mmax"] for q in env],
+        "A hiện tại (m²)":[elements[q["elem_idx"]]["A"] for q in env],
+        "I hiện tại (m⁴)":[elements[q["elem_idx"]]["I"] for q in env],
+    })
+    st.dataframe(df,use_container_width=True,hide_index=True)
+
+    st.markdown("### 2. Ứng viên biến phân")
+    cand,meta=variational_frame_candidate(r,elements,settings)
+    cdf=pd.DataFrame({
+        "Thanh":range(len(cand)),
+        "A*(x) quy đổi (m²)":[x[0] for x in cand],
+        "I*(x) quy đổi (m⁴)":[x[1] for x in cand],
+        "λA":[x for x in meta["lambdas_A"]]
+    })
+    st.dataframe(cdf,use_container_width=True,hide_index=True)
+
+    st.latex(r"A^*(x)=\max\left(\frac{|N(x)|}{\sigma_{allow}},\,|N(x)|\sqrt{\lambda/E}\right)")
+    st.caption("Ứng viên liên tục được suy ra từ trường nội lực FEM; sau đó được dùng làm điểm khởi tạo cho bài toán tối ưu số có ràng buộc chuyển vị FEM trực tiếp.")
+
+    if st.button("🚀 Tối ưu tiết diện",type="primary",use_container_width=True):
+        with st.spinner("Đang tối ưu và phân tích lại FEM..."):
+            out=finite_design_optimize(nodes,elements,supports,loads,settings)
+        st.session_state["dop_opt"]=out
+        st.session_state["dop_kkt"]=None
+        st.rerun()
+
+    out=st.session_state.get("dop_opt")
+    if out:
+        st.markdown("### 3. Phân tích lại sau tối ưu")
+        a,b,c=st.columns(3)
+        a.metric("V thép trước",f"{out['objective_initial']:.6g} m³")
+        b.metric("V thép sau",f"{out['objective_final']:.6g} m³")
+        c.metric("Chuyển vị sau",f"{out['d_final']*1000:.4f} mm")
+        if out["success"]: st.success(out["message"])
+        else: st.warning(out["message"])
+
+        rdf=pd.DataFrame({
+            "Thanh":range(len(out["A_final"])),
+            "A trước (m²)":out["A_initial"],
+            "A tối ưu (m²)":out["A_final"],
+            "I trước (m⁴)":out["I_initial"],
+            "I tối ưu (m⁴)":out["I_final"],
+            "Chiều dài (m)":out["lengths"]
+        })
+        st.dataframe(rdf,use_container_width=True,hide_index=True)
+
+        rr=out["opt_result"]
+        env2=force_envelopes(rr)
+        fig=go.Figure()
+        for q in env2:
+            i=q["elem_idx"]
+            fig.add_trace(go.Scatter(x=q["x"],y=q["N"],mode="lines",name=f"E{i} N(x)"))
+        fig.update_layout(title="Trường lực dọc sau tối ưu",xaxis_title="x cục bộ (m)",yaxis_title="N (kN)",height=360)
+        st.plotly_chart(fig,use_container_width=True)
+
+def render_kkt():
+    st.subheader("✅ Kiểm tra KKT")
+    out=st.session_state.get("dop_opt")
+    if not out:
+        st.info("Hãy chạy tối ưu trước.")
+        return
+    if st.button("🔎 Chạy kiểm tra KKT",type="primary"):
+        nodes,elements,supports,loads=_model_from_state()
+        settings=st.session_state.get("dop_settings", OptimizationSettings())
+        kkt=kkt_verify_design(nodes,elements,supports,loads,settings,out)
+        st.session_state["dop_kkt"]=kkt
+    kkt=st.session_state.get("dop_kkt")
+    if kkt:
+        c1,c2,c3,c4=st.columns(4)
+        c1.metric("Primal max violation",f"{kkt['primal_max_violation']:.3e}")
+        c2.metric("Stationarity",f"{kkt['stationarity_norm']:.3e}")
+        c3.metric("Complementarity",f"{kkt['complementarity_residual']:.3e}")
+        c4.metric("Dual feasible","YES" if kkt["dual_feasible"] else "NO")
+        st.latex(r"\nabla f(x^*)+J_g(x^*)^T\lambda=0,\qquad \lambda\ge0,\qquad g(x^*)\le0,\qquad \lambda_i g_i(x^*)=0")
+        st.write("Các đại lượng trên là kiểm tra số tại nghiệm tối ưu. KKT không tự động chứng minh nghiệm toàn cục nếu bài toán không lồi.")
+
+def render_report():
+    st.subheader("📄 Thuyết minh")
+    out=st.session_state.get("dop_opt")
+    kkt=st.session_state.get("dop_kkt")
+    if not out:
+        st.info("Hãy hoàn thành FEM và tối ưu trước.")
+        return
+    if kkt is None:
+        st.warning("Nên chạy kiểm tra KKT trước khi xuất thuyết minh.")
+        return
+    nodes,elements,supports,loads=_model_from_state()
+    info={"n_nodes":len(nodes),"n_elements":len(elements),"n_supports":len(supports)}
+    if st.button("📘 Tạo thuyết minh DOCX",type="primary",use_container_width=True):
+        data=build_report(info,out,kkt)
+        st.download_button("⬇️ Tải thuyết minh",data=data,file_name="DopTool_ThuyetMinh_ToiUu.docx",
+                           mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                           use_container_width=True)
 
 def main():
     st.markdown("""
-    <div class="hero">
-      <h1>🧠 Đớp Tool</h1>
-      <p>Structural Optimization Lab — FEM · Calculus of Variations · KKT</p>
-    </div>
-    """, unsafe_allow_html=True)
+    <style>
+    .dop-title{font-size:34px;font-weight:850;letter-spacing:.5px}
+    .dop-sub{opacity:.75;font-size:15px}
+    </style>
+    """,unsafe_allow_html=True)
+    st.markdown('<div class="dop-title">🏗️ ĐỚP TOOL</div><div class="dop-sub">Structural Analysis → Variational Optimization → KKT Verification</div>',unsafe_allow_html=True)
+    st.divider()
 
-    st.caption(
-        "Mục tiêu: dùng FEM để đánh giá cấu trúc, dùng Biến phân để tìm dạng thiết kế liên tục, "
-        "sau đó dùng KKT để kiểm chứng điều kiện tối ưu."
-    )
-
-    tabs = st.tabs([
-        "🏠 Tổng quan",
-        "1️⃣ Cấu kiện riêng lẻ",
-        "2️⃣ Biến phân A(x)",
-        "3️⃣ KKT Verification",
-        "4️⃣ Tối ưu toàn khung",
-    ])
-
+    tabs=st.tabs(["✏️ Mô hình FEM","🧮 Tối ưu biến phân","✅ KKT","📄 Thuyết minh"])
     with tabs[0]:
-        st.subheader("Kiến trúc tính toán")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.markdown("### 01 — FEM")
-            st.write("Tính chuyển vị, phản lực và nội lực cho cấu kiện/khung.")
-        with c2:
-            st.markdown("### 02 — Variational")
-            st.write("Thiết lập phiếm hàm và Euler–Lagrange để tìm dạng A*(x), I*(x).")
-        with c3:
-            st.markdown("### 03 — KKT")
-            st.write("Kiểm tra khả thi nguyên thủy, đối ngẫu, bổ sung và stationarity.")
-
-        st.info(
-            "Lưu ý: dàn thanh thuần túy tối ưu chủ yếu theo A(x). I(x) phù hợp với dầm/khung "
-            "khi độ cứng uốn là một phần của bài toán."
-        )
-
-        st.latex(
-            r"\min_{A(x),I(x)} J[A,I]"
-            r"\quad\text{s.t.}\quad"
-            r"g_i[A,I]\le0,\; h_j[A,I]=0"
-        )
-        st.markdown(
-            "**Luồng của Đớp Tool:**  "
-            "`Geometry → FEM → Objective/Constraints → Variational candidate → Numerical optimization → KKT check`"
-        )
-
+        ui.render_plane_frame()
     with tabs[1]:
-        st.subheader("Tối ưu một cấu kiện riêng lẻ")
-
-        left, right = st.columns([0.34, 0.66])
-        with left:
-            length = st.number_input("Chiều dài L (m)", 1.0, 100.0, 10.0, .5)
-            nseg = st.slider("Số đoạn FEM / số DOF thiết kế", 2, 30, 10)
-            load_type = st.selectbox("Trạng thái tải", ["axial", "bending", "combined"])
-            load = st.number_input("Tải tại đầu (kN)", -10000.0, 10000.0, 100.0, 10.0)
-
-            st.markdown("**Biến thiết kế**")
-            opt_A = st.checkbox("Tối ưu A(x)", True)
-            opt_I = st.checkbox("Tối ưu I(x)", False)
-
-            A0 = st.number_input("A ban đầu (m²)", 1e-4, .1, .01, 1e-4, format="%.6f")
-            I0 = st.number_input("I ban đầu (m⁴)", 1e-8, .01, 1e-4, 1e-6, format="%.8f")
-
-            sigma = st.number_input("σ cho phép (kN/m²)", 1e3, 1e6, 160e3, 1e3)
-            disp = st.number_input("u cho phép (m)", 1e-5, 1.0, .02, .001)
-            c = st.number_input("c — khoảng cách biên (m)", .001, 2.0, .10, .01)
-
-            run = st.button("🚀 Chạy tối ưu", type="primary", use_container_width=True)
-
-        with right:
-            if run:
-                settings = OptimizationSettings(
-                    sigma_allow=sigma,
-                    disp_allow=disp,
-                    c=c,
-                    optimize_A=opt_A,
-                    optimize_I=opt_I,
-                    I_min=max(I0*0.01, 1e-10),
-                    I_max=max(I0*100, I0*1.01),
-                    A_min=max(A0*0.01, 1e-6),
-                    A_max=max(A0*100, A0*1.01),
-                    volume_weight_I=0.0,
-                )
-                with st.spinner("FEM + SLSQP + KKT..."):
-                    result = optimize_single_member(
-                        length, nseg, settings, load_type, load, A0, I0
-                    )
-                st.session_state["last_opt"] = result
-
-            result = st.session_state.get("last_opt")
-            if result is None:
-                st.info("Thiết lập bài toán bên trái rồi nhấn Chạy tối ưu.")
-            else:
-                cols = st.columns(4)
-                vals = [
-                    ("Trạng thái", "OK" if result.success else "FAIL"),
-                    ("Objective", f"{result.objective:.5g} m²"),
-                    ("u_max", f"{result.max_displacement:.5g} m"),
-                    ("KKT", "PASS" if result.kkt["passed"] else "CHECK"),
-                ]
-                for col, (lab, val) in zip(cols, vals):
-                    with col:
-                        st.markdown(f'<div class="kpi"><b>{lab}</b><br>{val}</div>', unsafe_allow_html=True)
-
-                x = np.linspace(0, length, nseg)
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.plotly_chart(plot_distribution(x, result.A, "A*(x)", "A (m²)"),
-                                    use_container_width=True)
-                with c2:
-                    st.plotly_chart(plot_distribution(x, result.I, "I*(x)", "I (m⁴)"),
-                                    use_container_width=True)
-
-                st.write(result.message)
-                if result.history:
-                    st.dataframe(pd.DataFrame(result.history), use_container_width=True)
-
+        render_optimizer()
     with tabs[2]:
-        st.subheader("Biến phân bậc nhất — Euler–Lagrange cho A(x)")
-        st.markdown(
-            "Bài toán mẫu: **tối thiểu thể tích** của thanh chịu lực dọc, với ràng buộc chuyển vị và ứng suất."
-        )
-        st.latex(
-            r"\min_A\;J[A]=\int_0^L A(x)\,dx"
-        )
-        st.latex(
-            r"\text{s.t.}\quad"
-            r"\delta[A]=\int_0^L\frac{N(x)^2}{E\,A(x)}\,dx\le\delta_{allow},\qquad"
-            r"\frac{|N(x)|}{A(x)}\le\sigma_{allow}"
-        )
-        st.markdown("**Phiếm hàm Lagrange:**")
-        st.latex(
-            r"\mathcal{L}=\int_0^L\left[A(x)+\lambda\frac{N(x)^2}{E A(x)}\right]dx"
-        )
-        st.markdown("Vì F không chứa A'(x), phương trình Euler–Lagrange suy biến thành điều kiện đại số:")
-        st.latex(
-            r"\frac{\partial F}{\partial A}=0"
-            r"\;\Rightarrow\;"
-            r"1-\lambda\frac{N(x)^2}{E A(x)^2}=0"
-            r"\;\Rightarrow\;"
-            r"A^*(x)=|N(x)|\sqrt{\frac{\lambda}{E}}"
-        )
-        st.markdown(
-            "Khi đồng thời có ràng buộc ứng suất, nghiệm KKT có dạng:"
-        )
-        st.latex(
-            r"A^*(x)=\max\left("
-            r"\frac{|N(x)|}{\sigma_{allow}},\;"
-            r"|N(x)|\sqrt{\frac{\lambda}{E}}"
-            r"\right)"
-        )
-
-        st.divider()
-        st.markdown("### Thí nghiệm số")
-        L = st.number_input("L (m)", 1.0, 100.0, 10.0, .5, key="varL")
-        P = st.number_input("|N| (kN)", 1.0, 10000.0, 100.0, 10.0, key="varP")
-        E = st.number_input("E (kN/m²)", 1e5, 1e9, 200e6, 1e6, key="varE")
-        sig = st.number_input("σallow (kN/m²)", 1e3, 1e6, 160e3, 1e3, key="varSig")
-        du = st.number_input("δallow (m)", 1e-5, 1.0, .02, .001, key="varDu")
-
-        if st.button("Tính nghiệm Euler–Lagrange + KKT", key="run_var"):
-            out = variational_axial_solution(
-                lambda x: np.full_like(x, P), L, E, sig, du
-            )
-            st.session_state["var_out"] = out
-
-        out = st.session_state.get("var_out")
-        if out:
-            c1, c2 = st.columns(2)
-            with c1:
-                st.plotly_chart(
-                    plot_distribution(out["x"], out["A"], "Tiết diện tối ưu A*(x)", "A (m²)"),
-                    use_container_width=True
-                )
-            with c2:
-                st.metric("λ", f"{out['lambda']:.6g}")
-                st.metric("δ(A*)", f"{out['displacement']:.6g} m")
-                st.metric("V(A*)", f"{out['volume']:.6g} m²")
-            st.caption("Đây là nghiệm biến phân liên tục; bước FEM ở tab cấu kiện dùng nghiệm số để kiểm chứng.")
-
+        render_kkt()
     with tabs[3]:
-        st.subheader("Kiểm chứng KKT")
-        result = st.session_state.get("last_opt")
-        if result is None:
-            st.info("Hãy chạy một bài toán tối ưu ở tab Cấu kiện riêng lẻ trước.")
-        else:
-            k = result.kkt
-            st.write("### 1. Primal feasibility")
-            st.write(f"Max violation: `{k['primal_violation']:.4e}`")
-            st.write("### 2. Dual feasibility")
-            st.write(f"Max negative multiplier: `{k['dual_violation']:.4e}`")
-            st.write("### 3. Complementary slackness")
-            st.write(f"Max |λᵢgᵢ|: `{k['complementarity']:.4e}`")
-            st.write("### 4. Stationarity")
-            st.write(f"‖∇f + Σλᵢ∇gᵢ‖ = `{k['stationarity_norm']:.4e}`")
-            st.write("Active constraints:", k["active"])
-            st.dataframe(pd.DataFrame({
-                "constraint": np.arange(len(k["constraint_values"])),
-                "g(x)": k["constraint_values"],
-                "lambda": k["lambda"],
-            }), use_container_width=True)
-            st.success("KKT PASS" if k["passed"] else "KKT cần kiểm tra thêm")
+        render_report()
 
-    with tabs[4]:
-        st.subheader("Tối ưu toàn bộ khung — kiến trúc sẽ dùng chung FEM core")
-        st.warning(
-            "MVP này mới hoàn thiện bộ máy tối ưu cấu kiện. Tab này được dành cho optimizer cấp hệ: "
-            "A_e(x), I_e(x) → FEM toàn khung → constraints toàn hệ → KKT."
-        )
-        st.markdown("""
-        **Kiến trúc dự kiến:**
-
-        1. Người dùng vẽ/nhập khung.
-        2. `fem_core.solve_plane_frame()` phân tích hệ.
-        3. Mỗi phần tử có trường thiết kế `A_e(x), I_e(x)`.
-        4. Objective: tổng thể tích/khối lượng hoặc chi phí.
-        5. Constraints: chuyển vị nút, ứng suất, ổn định, giới hạn tiết diện.
-        6. Variational module sinh nghiệm liên tục ban đầu.
-        7. Numerical optimizer hiệu chỉnh nghiệm trên toàn hệ.
-        8. KKT module xác nhận nghiệm cuối.
-        """)
-        st.latex(
-            r"\min_{\{A_e(x),I_e(x)\}}\;"
-            r"\sum_e\int_0^{L_e}\rho A_e(x)\,dx"
-            r"\quad\text{s.t.}\quad"
-            r"\mathbf K(\mathbf A,\mathbf I)\mathbf U=\mathbf F"
-        )
-
-
-if __name__ == "__main__":
+if __name__=="__main__":
     main()

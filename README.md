@@ -1,12 +1,30 @@
-# Đớp Tool
+# Đớp Tool v2
 
-Structural Optimization Tool — FEM + Calculus of Variations + KKT.
+Đây là bản tích hợp lại đúng luồng bạn yêu cầu:
 
-## Kiến trúc
+1. **Mô hình FEM**
+   - Giữ canvas HTML/JS của web app ngày 08/10/2026.
+   - Kéo chuột để vẽ thanh.
+   - Gối tựa, di chuyển nút, xoá.
+   - Gán vật liệu + tiết diện.
+   - Gán tải nút và UDL.
+   - Solve FEM khung phẳng 2D.
+   - Xem N/V/M và đối chiếu Vereshchagin trong giao diện gốc.
 
-- `fem_core.py`: giữ nguyên FEM core hiện tại.
-- `optimization_core.py`: lớp tối ưu mới.
-- `dop_tool_app.py`: giao diện Streamlit.
+2. **Tối ưu biến phân**
+   - Lấy N(x), M(x) từ FEM.
+   - Dựng ứng viên liên tục A*(x) bằng Euler–Lagrange/KKT.
+   - Dùng ứng viên này làm điểm khởi tạo.
+   - Tối ưu hữu hạn chiều với FEM trong vòng lặp để ràng buộc chuyển vị được kiểm tra trực tiếp.
+
+3. **KKT**
+   - Kiểm tra primal feasibility.
+   - Dual feasibility.
+   - Stationarity.
+   - Complementary slackness.
+
+4. **Thuyết minh**
+   - Xuất DOCX gồm mô hình, hàm mục tiêu, biến phân, kết quả tối ưu và KKT.
 
 ## Chạy
 
@@ -15,49 +33,32 @@ pip install -r requirements.txt
 streamlit run dop_tool_app.py
 ```
 
-## Nguyên tắc
+## Lưu ý kỹ thuật
 
-### FEM
-FEM là bộ phân tích: từ geometry + loads + A/I → U, reactions, N/V/M.
+Bản này ưu tiên đúng kiến trúc nghiên cứu: FEM không bị thay thế bởi tối ưu hóa.
 
-### Variational
-Với bài toán thanh chịu lực dọc:
+Ứng viên biến phân sử dụng:
+J[A] = ∫ A(x) dx
 
-\[
-\min_A \int_0^L A(x)dx
-\]
+và ràng buộc năng lượng dọc:
+∫ N(x)^2/[E A(x)] dx <= C.
 
-\[
-\delta=\int_0^L \frac{N(x)^2}{EA(x)}dx\le\delta_{allow}
-\]
+Euler–Lagrange cho trường hợp không xuất hiện A'(x):
+∂F/∂A = 0
 
-Euler–Lagrange cho nghiệm trong miền:
+cho:
+A*(x) = max(|N(x)|/σ_allow, |N(x)| sqrt(λ/E)).
 
-\[
-A^*(x)=|N(x)|\sqrt{\lambda/E}.
-\]
+Đối với uốn, M(x) được lấy từ FEM và được dùng trong thành phần độ cứng uốn. Sau đó bài toán hữu hạn chiều kiểm tra chuyển vị FEM trực tiếp.
 
-Nếu có ràng buộc ứng suất:
+### Bước phát triển tiếp theo
 
-\[
-A^*(x)=\max\left(|N|/\sigma_{allow}, |N|\sqrt{\lambda/E}\right).
-\]
-
-### KKT
-Nghiệm số được kiểm tra:
-
-- primal feasibility
-- dual feasibility
-- complementary slackness
-- stationarity
-
-## Giai đoạn tiếp theo
-
-1. Truss solver riêng với DOF `[ux, uy]`.
-2. Frame optimizer toàn hệ.
-3. Buckling constraint.
-4. Stress interaction.
-5. Section library: thép hình, thép hộp, tiết diện tổ hợp.
-6. Continuous-to-discrete mapping: A*(x), I*(x) → tiết diện chế tạo.
-7. Multi-load cases.
-8. Robust / manufacturability constraints.
+- Truss FEM riêng với DOF [ux, uy].
+- Tối ưu A(x) thuần biến phân cho giàn.
+- Section family thực: I/H, hộp, ống tròn, thép góc.
+- Quan hệ A-I theo hình học, không tối ưu A và I độc lập.
+- Buckling Euler và ổn định theo TCVN 5575:2024.
+- Nhiều trường hợp tải.
+- Sensitivity FEM: dU/dp = -K^-1(dK/dp)U.
+- Tối ưu toàn khung với biến thiết kế liên tục theo từng phần tử/đoạn.
+- Chuyển nghiệm liên tục sang tiết diện thép thương mại.
